@@ -66,4 +66,48 @@ public class UserController {
         String url = camundaUrl + "/user/" + id;
         restTemplate.delete(url);
     }
+
+    // --- PHASE 3: MEMBERSHIP MANAGEMENT ---
+
+    // 7. List groups for a user
+    @GetMapping("/{id}/groups")
+    public Object getUserGroups(@PathVariable String id) {
+        String url = camundaUrl + "/group?member=" + id;
+        return restTemplate.getForObject(url, Object.class);
+    }
+
+    // 8. Add user to a group
+    @PutMapping("/{id}/groups/{groupId}")
+    public void addUserToGroup(@PathVariable String id, @PathVariable String groupId) {
+        String url = camundaUrl + "/group/" + groupId + "/members/" + id;
+        restTemplate.put(url, null);
+    }
+
+    // 9. Remove user from a group
+    @DeleteMapping("/{id}/groups/{groupId}")
+    public void removeUserFromGroup(@PathVariable String id, @PathVariable String groupId) {
+        String url = camundaUrl + "/group/" + groupId + "/members/" + id;
+        restTemplate.delete(url);
+    }
+
+    // 10. List tenants for a user
+    @GetMapping("/{id}/tenants")
+    public Object getUserTenants(@PathVariable String id) {
+        String url = camundaUrl + "/tenant?userMember=" + id;
+        return restTemplate.getForObject(url, Object.class);
+    }
+
+    // 11. Add user to a tenant
+    @PutMapping("/{id}/tenants/{tenantId}")
+    public void addUserToTenant(@PathVariable String id, @PathVariable String tenantId) {
+        String url = camundaUrl + "/tenant/" + tenantId + "/user-members/" + id;
+        restTemplate.put(url, null);
+    }
+
+    // 12. Remove user from a tenant
+    @DeleteMapping("/{id}/tenants/{tenantId}")
+    public void removeUserFromTenant(@PathVariable String id, @PathVariable String tenantId) {
+        String url = camundaUrl + "/tenant/" + tenantId + "/user-members/" + id;
+        restTemplate.delete(url);
+    }
 }
