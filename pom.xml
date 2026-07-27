@@ -46,6 +46,26 @@
 			<artifactId>camunda-engine</artifactId>
 			<version>7.21.0</version>
 		</dependency>
+
+		<!-- Spring Data JPA for Database ORM & Table Generation -->
+		<dependency>
+			<groupId>org.springframework.boot</groupId>
+			<artifactId>spring-boot-starter-data-jpa</artifactId>
+		</dependency>
+
+		<!-- Modern MySQL JDBC Driver -->
+		<dependency>
+			<groupId>com.mysql</groupId>
+			<artifactId>mysql-connector-j</artifactId>
+			<scope>runtime</scope>
+		</dependency>
+
+		<!-- Spring AOP for Universal API Interception -->
+		<dependency>
+			<groupId>org.springframework.boot</groupId>
+			<artifactId>spring-boot-starter-aop</artifactId>
+		</dependency>
+
 	</dependencies>
 
 	<build>

@@ -1,5 +1,6 @@
 package com.example.camunda_backend.controller;
 
+import com.example.camunda_backend.service.TaskSyncService;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
@@ -15,6 +16,11 @@ public class TaskController {
     private String camundaUrl;
 
     private final RestTemplate restTemplate = new RestTemplate();
+    private final TaskSyncService taskSyncService;
+
+    public TaskController(TaskSyncService taskSyncService) {
+        this.taskSyncService = taskSyncService;
+    }
 
     // Sandboxed Task Fetcher: Enforces RBAC query filtering
     @GetMapping("/my-tasks")
@@ -91,9 +97,25 @@ public class TaskController {
     public ResponseEntity<?> completeTask(@PathVariable String taskId, @RequestBody(required = false) Map<String, Object> payload) {
         try {
             String url = camundaUrl + "/task/" + taskId + "/complete";
-            // Camunda API expects format: {"variables": {"nextReviewer": {"value": "lakshan", "type": "String"}}}
             restTemplate.postForLocation(url, payload != null ? payload : Collections.emptyMap());
-            return ResponseEntity.ok(Map.of("status", "Task completed and routed successfully!"));
+
+            // Extract decision and comment from payload variables if they exist
+            String decision = "Completed";
+            String comment = "";
+            if (payload != null && payload.get("variables") instanceof Map) {
+                Map<?, ?> vars = (Map<?, ?>) payload.get("variables");
+                if (vars.containsKey("decision") && ((Map<?, ?>) vars.get("decision")).get("value") != null) {
+                    decision = ((Map<?, ?>) vars.get("decision")).get("value").toString();
+                }
+                if (vars.containsKey("comment") && ((Map<?, ?>) vars.get("comment")).get("value") != null) {
+                    comment = ((Map<?, ?>) vars.get("comment")).get("value").toString();
+                }
+            }
+
+            // INSTANT MYSQL SYNC: Mark completed in custom database!
+            taskSyncService.syncTaskCompletion(taskId, decision, comment);
+
+            return ResponseEntity.ok(Map.of("status", "Task completed and synced to MySQL successfully!"));
         } catch (Exception e) {
             return ResponseEntity.status(500).body(Map.of("error", e.getMessage()));
         }
