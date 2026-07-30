@@ -1,8 +1,10 @@
 package com.example.camunda_backend.controller;
 
+import com.example.camunda_backend.service.BusinessDataService;
 import com.example.camunda_backend.service.TaskSyncService;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.ResponseEntity;
+import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.client.RestTemplate;
 import java.util.*;
@@ -17,9 +19,11 @@ public class TaskController {
 
     private final RestTemplate restTemplate = new RestTemplate();
     private final TaskSyncService taskSyncService;
+    private final BusinessDataService businessDataService;
 
-    public TaskController(TaskSyncService taskSyncService) {
+    public TaskController(TaskSyncService taskSyncService, BusinessDataService businessDataService) {
         this.taskSyncService = taskSyncService;
+        this.businessDataService = businessDataService;
     }
 
     // Sandboxed Task Fetcher: Enforces RBAC query filtering
@@ -92,30 +96,59 @@ public class TaskController {
         }
     }
 
-    // 4. WORKER COMPLETION: Complete a task and attach dynamic process variables for next stage routing
+    // 4. TRANSACTIONAL COMPLETE ENDPOINT: Strips business data -> Saves to MySQL -> Completes Camunda Task
     @PostMapping("/{taskId}/complete")
-    public ResponseEntity<?> completeTask(@PathVariable String taskId, @RequestBody(required = false) Map<String, Object> payload) {
+    @Transactional // Guarantees that if Camunda API fails, MySQL writes roll back automatically!
+    public ResponseEntity<?> completeTask(@PathVariable String taskId, 
+                                          @RequestHeader(value = "X-User-Id", defaultValue = "ANONYMOUS") String userId,
+                                          @RequestBody(required = false) Map<String, Object> payload) {
         try {
-            String url = camundaUrl + "/task/" + taskId + "/complete";
-            restTemplate.postForLocation(url, payload != null ? payload : Collections.emptyMap());
+            // A. Fetch task details from Camunda first to get the true Process Instance ID
+            String taskUrl = camundaUrl + "/task/" + taskId;
+            Map<?, ?> taskInfo = restTemplate.getForObject(taskUrl, Map.class);
+            String processId = taskInfo != null && taskInfo.get("processInstanceId") != null ? taskInfo.get("processInstanceId").toString() : "UNKNOWN";
 
-            // Extract decision and comment from payload variables if they exist
-            String decision = "Completed";
-            String comment = "";
-            if (payload != null && payload.get("variables") instanceof Map) {
-                Map<?, ?> vars = (Map<?, ?>) payload.get("variables");
-                if (vars.containsKey("decision") && ((Map<?, ?>) vars.get("decision")).get("value") != null) {
-                    decision = ((Map<?, ?>) vars.get("decision")).get("value").toString();
-                }
-                if (vars.containsKey("comment") && ((Map<?, ?>) vars.get("comment")).get("value") != null) {
-                    comment = ((Map<?, ?>) vars.get("comment")).get("value").toString();
-                }
-            }
+            // B. Separate payload: Save heavy form data to MySQL table, return only lightweight routing variables!
+            Map<String, Object> rawVariables = (payload != null && payload.get("variables") instanceof Map) ? 
+                    (Map<String, Object>) payload.get("variables") : Collections.emptyMap();
+            
+            Map<String, Object> cleanEngineVariables = businessDataService.extractAndSaveBusinessData(processId, taskId, userId, rawVariables);
 
-            // INSTANT MYSQL SYNC: Mark completed in custom database!
+            // C. Forward ONLY the lightweight routing variables (e.g. nextReviewer, decision) to Camunda Engine!
+            String completeUrl = camundaUrl + "/task/" + taskId + "/complete";
+            restTemplate.postForLocation(completeUrl, Map.of("variables", cleanEngineVariables));
+
+            // D. Extract decision and comment for our task activity mirror sync
+            String decision = rawVariables.containsKey("decision") ? ((Map<?, ?>) rawVariables.get("decision")).get("value").toString() : "Completed";
+            String comment = rawVariables.containsKey("comment") ? ((Map<?, ?>) rawVariables.get("comment")).get("value").toString() : "";
             taskSyncService.syncTaskCompletion(taskId, decision, comment);
 
-            return ResponseEntity.ok(Map.of("status", "Task completed and synced to MySQL successfully!"));
+            return ResponseEntity.ok(Map.of("status", "Task completed! Business data saved to MySQL and workflow routed successfully!"));
+        } catch (Exception e) {
+            // Because of @Transactional, any failure here immediately rolls back the MySQL business data inserts!
+            return ResponseEntity.status(500).body(Map.of("error", e.getMessage()));
+        }
+    }
+
+    // 5. UPGRADED FORM-FIELDS ENDPOINT: Merges Camunda engine variables with MySQL business data!
+    @GetMapping("/{taskId}/form-fields")
+    public ResponseEntity<?> getTaskFormFields(@PathVariable String taskId) {
+        try {
+            // A. Fetch task details to get Process Instance ID
+            String taskUrl = camundaUrl + "/task/" + taskId;
+            Map<?, ?> taskInfo = restTemplate.getForObject(taskUrl, Map.class);
+            String processId = taskInfo != null && taskInfo.get("processInstanceId") != null ? taskInfo.get("processInstanceId").toString() : null;
+
+            // B. Fetch whatever variables exist in Camunda (routing rules, etc.)
+            String varsUrl = camundaUrl + "/task/" + taskId + "/variables";
+            Map<String, Object> camundaVars = restTemplate.getForObject(varsUrl, Map.class);
+            if (camundaVars == null) camundaVars = new HashMap<>();
+
+            // C. Fetch all custom business data from MySQL and merge it into one seamless dictionary!
+            Map<String, Object> mysqlBusinessData = businessDataService.getMergedBusinessData(processId);
+            camundaVars.putAll(mysqlBusinessData);
+
+            return ResponseEntity.ok(camundaVars);
         } catch (Exception e) {
             return ResponseEntity.status(500).body(Map.of("error", e.getMessage()));
         }
