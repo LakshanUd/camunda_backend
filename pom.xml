@@ -66,6 +66,12 @@
 			<artifactId>spring-boot-starter-aop</artifactId>
 		</dependency>
 
+		<dependency>
+			<groupId>org.camunda.bpm.springboot</groupId>
+			<artifactId>camunda-bpm-spring-boot-starter-rest</artifactId>
+			<version>7.21.0</version> <!-- Adjust to match your current Camunda version if necessary -->
+		</dependency>
+
 	</dependencies>
 
 	<build>

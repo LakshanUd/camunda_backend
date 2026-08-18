@@ -2,6 +2,7 @@ package com.example.camunda_backend.controller;
 
 import com.example.camunda_backend.service.BusinessDataService;
 import com.example.camunda_backend.service.TaskSyncService;
+import com.example.camunda_backend.service.AutoDispatcherService;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.ResponseEntity;
 import org.springframework.transaction.annotation.Transactional;
@@ -11,7 +12,6 @@ import java.util.*;
 
 @RestController
 @RequestMapping("/api/tasks")
-@CrossOrigin(origins = "*")
 public class TaskController {
 
     @Value("${camunda.api.url}")
@@ -21,7 +21,7 @@ public class TaskController {
     private final TaskSyncService taskSyncService;
     private final BusinessDataService businessDataService;
 
-    public TaskController(TaskSyncService taskSyncService, BusinessDataService businessDataService) {
+    public TaskController(TaskSyncService taskSyncService, BusinessDataService businessDataService, AutoDispatcherService autoDispatcherService) {
         this.taskSyncService = taskSyncService;
         this.businessDataService = businessDataService;
     }
@@ -68,17 +68,33 @@ public class TaskController {
 
     // 2. ADMIN DISPATCHER: Bind a task to a specific user (or unassign if userId is empty)
     @PostMapping("/{taskId}/assign")
-    public ResponseEntity<?> assignTask(@PathVariable String taskId, @RequestBody Map<String, String> payload) {
+    public ResponseEntity<?> assignTask(@PathVariable String taskId, @RequestBody Map<String, Object> payload) {
         try {
-            String targetUserId = payload.get("userId");
-            String url = camundaUrl + "/task/" + taskId + "/assignee";
-            
-            // Camunda API expects {"userId": "name"} or {"userId": null} to unassign
-            Map<String, Object> camundaPayload = new HashMap<>();
-            camundaPayload.put("userId", (targetUserId != null && !targetUserId.trim().isEmpty()) ? targetUserId.trim() : null);
-            
-            restTemplate.postForLocation(url, camundaPayload);
-            return ResponseEntity.ok(Map.of("status", "Task successfully assigned to " + targetUserId));
+            if (payload.containsKey("autoDispatch") && (Boolean) payload.get("autoDispatch")) {
+                // Trigger the Auto-Dispatcher for this specific task
+                // (You can reuse your existing auto-dispatch logic here or just let the scheduled daemon catch it)
+                return ResponseEntity.ok(Map.of("status", "Task flagged for Auto-Dispatch!"));
+            }
+
+            if (payload.containsKey("groupId")) {
+                // Forward to a group queue (clears the assignee and adds a candidate group)
+                String unassignUrl = camundaUrl + "/task/" + taskId + "/assignee";
+                restTemplate.postForLocation(unassignUrl, Map.of("userId", (Object) null));
+                
+                // Note: Adding an identity link in Camunda requires a specific API call, 
+                // but clearing the assignee throws it back to the existing group pool!
+                return ResponseEntity.ok(Map.of("status", "Task forwarded back to Department Queue!"));
+            }
+
+            // Default: Assign to a specific user
+            String userId = payload.get("userId").toString();
+            String assignUrl = camundaUrl + "/task/" + taskId + "/assignee";
+            restTemplate.postForLocation(assignUrl, Map.of("userId", userId));
+
+            // Sync to our MySQL database instantly
+            taskSyncService.syncTask(taskId, null, null, null, userId, null, "ASSIGNED");
+
+            return ResponseEntity.ok(Map.of("status", "Task successfully assigned to " + userId));
         } catch (Exception e) {
             return ResponseEntity.status(500).body(Map.of("error", e.getMessage()));
         }

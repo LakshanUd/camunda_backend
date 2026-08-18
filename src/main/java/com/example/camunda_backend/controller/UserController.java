@@ -7,7 +7,6 @@ import java.util.Map;
 
 @RestController
 @RequestMapping("/api/users")
-@CrossOrigin(origins = "*") 
 public class UserController {
 
     @Value("${camunda.api.url}")
