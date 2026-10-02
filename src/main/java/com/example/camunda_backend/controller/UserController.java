@@ -1,112 +1,113 @@
 package com.example.camunda_backend.controller;
 
-import org.springframework.beans.factory.annotation.Value;
+import com.example.camunda_backend.dto.UserCreateRequest;
+import com.example.camunda_backend.dto.UserDto;
+import com.example.camunda_backend.dto.UserUpdateRequest;
+import com.example.camunda_backend.service.UserService;
+import jakarta.validation.Valid;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.security.access.prepost.PreAuthorize;
 import org.springframework.web.bind.annotation.*;
-import org.springframework.web.client.RestTemplate;
+
+import java.util.List;
 import java.util.Map;
 
 @RestController
 @RequestMapping("/api/users")
 public class UserController {
 
-    @Value("${camunda.api.url}")
-    private String camundaUrl;
+    private final UserService userService;
 
-    private final RestTemplate restTemplate = new RestTemplate();
-
-    // --- PHASE 1: LOGIN ENDPOINT ---
-
-    @PostMapping("/login")
-    public Object verifyLogin(@RequestBody Map<String, String> credentials) {
-        String url = camundaUrl + "/identity/verify";
-        return restTemplate.postForObject(url, credentials, Object.class);
+    public UserController(UserService userService) {
+        this.userService = userService;
     }
 
-    // --- PHASE 2: ADMIN USER MANAGEMENT ENDPOINTS ---
-
-    // 1. Get all users
+    // 1. Get all users from MySQL
     @GetMapping
-    public Object getAllUsers() {
-        String url = camundaUrl + "/user";
-        return restTemplate.getForObject(url, Object.class);
+    @PreAuthorize("hasRole('ADMIN')")
+    public ResponseEntity<List<UserDto>> getAllUsers() {
+        return ResponseEntity.ok(userService.getAllUsers());
     }
 
-    // 2. Create new user
-    @PostMapping("/create")
-    public Object createUser(@RequestBody Map<String, Object> payload) {
-        String url = camundaUrl + "/user/create";
-        return restTemplate.postForObject(url, payload, Object.class);
+    // 2. Get single user details
+    @GetMapping("/{id}")
+    @PreAuthorize("hasRole('ADMIN') or #id == authentication.principal.id or #id == authentication.principal.username")
+    public ResponseEntity<UserDto> getUserById(@PathVariable String id) {
+        return ResponseEntity.ok(userService.getUserById(id));
     }
 
-    // 3. Get single user profile
-    @GetMapping("/{id}/profile")
-    public Object getUserProfile(@PathVariable String id) {
-        String url = camundaUrl + "/user/" + id + "/profile";
-        return restTemplate.getForObject(url, Object.class);
+    // 3. Create a new user in MySQL
+    @PostMapping
+    @PreAuthorize("hasRole('ADMIN')")
+    public ResponseEntity<UserDto> createUser(@Valid @RequestBody UserCreateRequest request) {
+        UserDto created = userService.createUser(request);
+        return ResponseEntity.status(HttpStatus.CREATED).body(created);
     }
 
-    // 4. Update user profile
-    @PutMapping("/{id}/profile")
-    public void updateUserProfile(@PathVariable String id, @RequestBody Map<String, Object> profile) {
-        String url = camundaUrl + "/user/" + id + "/profile";
-        restTemplate.put(url, profile);
+    // 4. Update an existing user
+    @PutMapping("/{id}")
+    @PreAuthorize("hasRole('ADMIN')")
+    public ResponseEntity<UserDto> updateUser(@PathVariable String id, @Valid @RequestBody UserUpdateRequest request) {
+        UserDto updated = userService.updateUser(id, request);
+        return ResponseEntity.ok(updated);
     }
 
-    // 5. Update user credentials (password)
-    @PutMapping("/{id}/credentials")
-    public void updateUserCredentials(@PathVariable String id, @RequestBody Map<String, Object> credentials) {
-        String url = camundaUrl + "/user/" + id + "/credentials";
-        restTemplate.put(url, credentials);
+    // 5. Enable or disable user status
+    @PatchMapping("/{id}/status")
+    @PreAuthorize("hasRole('ADMIN')")
+    public ResponseEntity<?> toggleUserStatus(@PathVariable String id, @RequestBody Map<String, Boolean> payload) {
+        boolean active = payload.getOrDefault("active", true);
+        try {
+            userService.toggleUserStatus(id, active);
+            return ResponseEntity.ok(Map.of(
+                    "message", "User status updated successfully",
+                    "id", id,
+                    "active", active
+            ));
+        } catch (IllegalStateException e) {
+            return ResponseEntity.badRequest().body(Map.of("error", e.getMessage()));
+        }
     }
 
-    // 6. Delete user
+    // 6. Delete user from MySQL
     @DeleteMapping("/{id}")
-    public void deleteUser(@PathVariable String id) {
-        String url = camundaUrl + "/user/" + id;
-        restTemplate.delete(url);
+    @PreAuthorize("hasRole('ADMIN')")
+    public ResponseEntity<?> deleteUser(@PathVariable String id) {
+        try {
+            userService.deleteUser(id);
+            return ResponseEntity.ok(Map.of("message", "User deleted successfully", "id", id));
+        } catch (IllegalStateException e) {
+            return ResponseEntity.badRequest().body(Map.of("error", e.getMessage()));
+        }
     }
 
-    // --- PHASE 3: MEMBERSHIP MANAGEMENT ---
-
-    // 7. List groups for a user
-    @GetMapping("/{id}/groups")
-    public Object getUserGroups(@PathVariable String id) {
-        String url = camundaUrl + "/group?member=" + id;
-        return restTemplate.getForObject(url, Object.class);
+    // 7. Profile endpoints (accessible by self or admin)
+    @GetMapping("/{id}/profile")
+    @PreAuthorize("hasRole('ADMIN') or #id == authentication.principal.id or #id == authentication.principal.username")
+    public ResponseEntity<?> getProfile(@PathVariable String id) {
+        return ResponseEntity.ok(userService.getUserProfile(id));
     }
 
-    // 8. Add user to a group
-    @PutMapping("/{id}/groups/{groupId}")
-    public void addUserToGroup(@PathVariable String id, @PathVariable String groupId) {
-        String url = camundaUrl + "/group/" + groupId + "/members/" + id;
-        restTemplate.put(url, null);
+    @PutMapping("/{id}/profile")
+    @PreAuthorize("hasRole('ADMIN') or #id == authentication.principal.id or #id == authentication.principal.username")
+    public ResponseEntity<?> updateProfile(@PathVariable String id, @RequestBody Map<String, Object> payload) {
+        try {
+            userService.updateUserProfile(id, payload);
+            return ResponseEntity.ok(Map.of("message", "Profile updated successfully"));
+        } catch (IllegalArgumentException e) {
+            return ResponseEntity.badRequest().body(Map.of("error", e.getMessage()));
+        }
     }
 
-    // 9. Remove user from a group
-    @DeleteMapping("/{id}/groups/{groupId}")
-    public void removeUserFromGroup(@PathVariable String id, @PathVariable String groupId) {
-        String url = camundaUrl + "/group/" + groupId + "/members/" + id;
-        restTemplate.delete(url);
-    }
-
-    // 10. List tenants for a user
-    @GetMapping("/{id}/tenants")
-    public Object getUserTenants(@PathVariable String id) {
-        String url = camundaUrl + "/tenant?userMember=" + id;
-        return restTemplate.getForObject(url, Object.class);
-    }
-
-    // 11. Add user to a tenant
-    @PutMapping("/{id}/tenants/{tenantId}")
-    public void addUserToTenant(@PathVariable String id, @PathVariable String tenantId) {
-        String url = camundaUrl + "/tenant/" + tenantId + "/user-members/" + id;
-        restTemplate.put(url, null);
-    }
-
-    // 12. Remove user from a tenant
-    @DeleteMapping("/{id}/tenants/{tenantId}")
-    public void removeUserFromTenant(@PathVariable String id, @PathVariable String tenantId) {
-        String url = camundaUrl + "/tenant/" + tenantId + "/user-members/" + id;
-        restTemplate.delete(url);
+    @PutMapping("/{id}/credentials")
+    @PreAuthorize("hasRole('ADMIN') or #id == authentication.principal.id or #id == authentication.principal.username")
+    public ResponseEntity<?> updateCredentials(@PathVariable String id, @RequestBody Map<String, String> payload) {
+        try {
+            userService.updateUserCredentials(id, payload);
+            return ResponseEntity.ok(Map.of("message", "Credentials updated successfully"));
+        } catch (IllegalArgumentException e) {
+            return ResponseEntity.badRequest().body(Map.of("error", e.getMessage()));
+        }
     }
 }
