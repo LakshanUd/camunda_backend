@@ -274,6 +274,66 @@ public class TaskInterceptorService implements TaskListener {
         log.info("[ASSIGNMENT] Task '{}' manually assigned to candidateGroup '{}'", taskId, groupId);
     }
 
+    public void claimTask(String taskId, String username) {
+        if (taskId == null || username == null) return;
+        try {
+            // Camunda's native /task/{id}/claim sets assignee while preserving candidateGroup identity links
+            String url = camundaApiUrl + "/task/" + taskId + "/claim";
+            restTemplate.postForLocation(url, Collections.singletonMap("userId", username));
+            log.info("[CLAIM] Task '{}' claimed by user '{}'", taskId, username);
+        } catch (Exception e) {
+            log.warn("[CLAIM] Camunda /claim call failed for task '{}': {}, falling back to direct assignee", taskId, e.getMessage());
+            assignTaskAssignee(taskId, username);
+        }
+    }
+
+    public void unclaimTask(String taskId, String fallbackGroupId) {
+        if (taskId == null) return;
+        try {
+            // Camunda's native /task/{id}/unclaim sets assignee to null while keeping candidate links intact
+            String url = camundaApiUrl + "/task/" + taskId + "/unclaim";
+            restTemplate.postForLocation(url, Collections.emptyMap());
+            log.info("[UNCLAIM] Task '{}' unclaimed via Camunda API", taskId);
+        } catch (Exception e) {
+            log.warn("[UNCLAIM] Camunda /unclaim call failed for task '{}': {}, resetting assignee", taskId, e.getMessage());
+            try {
+                restTemplate.postForLocation(camundaApiUrl + "/task/" + taskId + "/assignee", Collections.singletonMap("userId", null));
+            } catch (Exception ignored) {}
+        }
+
+        // Ensure candidate links exist so task returns to group pool
+        if (!hasCandidateLinks(taskId)) {
+            String targetGroup = fallbackGroupId;
+            if (targetGroup == null || targetGroup.isBlank()) {
+                try {
+                    Map<String, Object> task = restTemplate.getForObject(camundaApiUrl + "/task/" + taskId, Map.class);
+                    if (task != null) {
+                        String procDefId = (String) task.get("processDefinitionId");
+                        String taskDefKey = (String) task.get("taskDefinitionKey");
+                        String workflowKey = extractWorkflowKey(procDefId);
+                        Optional<TaskRoutingRule> ruleOpt = routingRuleRepo.findByWorkflowKeyAndTaskId(workflowKey, taskDefKey);
+                        if (ruleOpt.isPresent() && ruleOpt.get().getRoutingType() == TaskRoutingRule.RoutingType.SELECT_GROUP) {
+                            targetGroup = ruleOpt.get().getTargetGroupId();
+                        } else {
+                            List<WorkflowAuthorization> auths = authRepo.findByWorkflowKey(workflowKey);
+                            for (WorkflowAuthorization a : auths) {
+                                if (a.isGroupAuthorization()) {
+                                    targetGroup = a.getGroupId();
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                } catch (Exception ignored) {}
+            }
+
+            if (targetGroup != null && !targetGroup.isBlank()) {
+                addCandidateGroup(taskId, targetGroup);
+                log.info("[UNCLAIM] Restored candidateGroup '{}' on unclaimed task '{}'", targetGroup, taskId);
+            }
+        }
+    }
+
     public void unassignTask(String taskId) {
         try {
             restTemplate.postForLocation(camundaApiUrl + "/task/" + taskId + "/assignee",
@@ -384,6 +444,42 @@ public class TaskInterceptorService implements TaskListener {
                         }
                     }
                 } catch (Exception ignored) {}
+
+                if (task.get("candidateGroup") == null) {
+                    try {
+                        String procDefId = (String) task.get("processDefinitionId");
+                        String taskDefKey = (String) task.get("taskDefinitionKey");
+                        if (procDefId != null && taskDefKey != null) {
+                            String workflowKey = extractWorkflowKey(procDefId);
+                            Optional<TaskRoutingRule> ruleOpt = routingRuleRepo.findByWorkflowKeyAndTaskId(workflowKey, taskDefKey);
+                            if (ruleOpt.isPresent() && ruleOpt.get().getRoutingType() == TaskRoutingRule.RoutingType.SELECT_GROUP) {
+                                String gId = ruleOpt.get().getTargetGroupId();
+                                if (gId != null && !gId.isBlank()) {
+                                    task.put("candidateGroup", gId);
+                                    task.put("candidateGroupName", groupNames.getOrDefault(gId, gId));
+                                    task.put("candidateGroups", List.of(gId));
+                                }
+                            }
+                        }
+                    } catch (Exception ignored) {}
+                }
+
+                // Task duration calculation
+                Number taskDur = (Number) task.get("durationInMillis");
+                if (taskDur != null) {
+                    task.put("duration", taskDur.longValue());
+                } else {
+                    String taskStartStr = (String) task.get("startTime");
+                    if (taskStartStr != null) {
+                        try {
+                            java.text.SimpleDateFormat sdf = new java.text.SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSSX");
+                            long startMs = sdf.parse(taskStartStr).getTime();
+                            task.put("duration", Math.max(0, System.currentTimeMillis() - startMs));
+                        } catch (Exception ex) {
+                            task.put("duration", null);
+                        }
+                    }
+                }
             }
         }
         return tasks;

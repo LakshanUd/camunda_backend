@@ -273,6 +273,45 @@ public class CamundaProxyController {
         }
     }
 
+    @PostMapping("/tasks/{taskId}/claim")
+    public ResponseEntity<?> claimTask(@PathVariable String taskId,
+                                       @RequestBody(required = false) Map<String, Object> payload,
+                                       Authentication authentication) {
+        try {
+            String username = null;
+            if (payload != null && payload.get("userId") != null) {
+                username = (String) payload.get("userId");
+            }
+            if (username == null || username.isBlank()) {
+                if (authentication != null && authentication.getPrincipal() instanceof CustomUserPrincipal p) {
+                    username = p.getUsername();
+                } else if (authentication != null) {
+                    username = authentication.getName();
+                }
+            }
+            taskInterceptorService.claimTask(taskId, username);
+            return ResponseEntity.ok(Map.of("status", "Task claimed successfully", "taskId", taskId, "userId", username != null ? username : ""));
+        } catch (HttpStatusCodeException e) {
+            return ResponseEntity.status(e.getStatusCode()).body(e.getResponseBodyAsString());
+        } catch (Exception e) {
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(Map.of("error", e.getMessage()));
+        }
+    }
+
+    @PostMapping("/tasks/{taskId}/unclaim")
+    public ResponseEntity<?> unclaimTask(@PathVariable String taskId,
+                                         @RequestBody(required = false) Map<String, Object> payload) {
+        try {
+            String groupId = (payload != null && payload.get("groupId") != null) ? String.valueOf(payload.get("groupId")) : null;
+            taskInterceptorService.unclaimTask(taskId, groupId);
+            return ResponseEntity.ok(Map.of("status", "Task unclaimed successfully", "taskId", taskId));
+        } catch (HttpStatusCodeException e) {
+            return ResponseEntity.status(e.getStatusCode()).body(e.getResponseBodyAsString());
+        } catch (Exception e) {
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(Map.of("error", e.getMessage()));
+        }
+    }
+
     @GetMapping("/tasks/{taskId}/variables")
     public ResponseEntity<?> getTaskVariables(@PathVariable String taskId) {
         try {
@@ -468,6 +507,347 @@ public class CamundaProxyController {
             Map<String, Object> result = new HashMap<>();
             result.put("task", taskData);
             result.put("variables", variables);
+            return ResponseEntity.ok(result);
+        } catch (HttpStatusCodeException e) {
+            return ResponseEntity.status(e.getStatusCode()).body(e.getResponseBodyAsString());
+        } catch (Exception e) {
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(Map.of("error", e.getMessage()));
+        }
+    }
+
+    // ========================================================================
+    // COMPLETED PROCESS INSTANCES & AUDIT TRAIL
+    // ========================================================================
+
+    @GetMapping({"/instances", "/instances/completed"})
+    public ResponseEntity<?> getCompletedInstances(
+            @RequestParam(required = false) String processDefinitionKey,
+            @RequestParam(required = false) String status,
+            Authentication authentication) {
+        try {
+            boolean isAdmin = authentication != null && authentication.getAuthorities().stream()
+                    .anyMatch(a -> a.getAuthority().equals("ROLE_ADMIN") || a.getAuthority().equals("ADMIN"));
+
+            String username = "anonymous";
+            if (authentication != null && authentication.getPrincipal() instanceof CustomUserPrincipal principal) {
+                username = principal.getUsername();
+            } else if (authentication != null) {
+                username = authentication.getName();
+            }
+
+            boolean activeOnly = "ACTIVE".equalsIgnoreCase(status);
+            boolean finishedOnly = "COMPLETED".equalsIgnoreCase(status);
+
+            Map<String, String> userNames = taskInterceptorService.fetchUserNamesMap();
+
+            // 1. Fetch starter variable map (processInstanceId -> starter username)
+            Map<String, String> starterVarMap = new HashMap<>();
+            try {
+                String varUrl = camundaUrl + "/history/variable-instance?variableName=starterUserId";
+                ResponseEntity<List<Map<String, Object>>> varResp = restTemplate.exchange(
+                        varUrl, HttpMethod.GET, null, new ParameterizedTypeReference<>() {});
+                if (varResp.getBody() != null) {
+                    for (Map<String, Object> v : varResp.getBody()) {
+                        String piId = (String) v.get("processInstanceId");
+                        String val = (String) v.get("value");
+                        if (piId != null && val != null) {
+                            starterVarMap.put(piId, val);
+                        }
+                    }
+                }
+            } catch (Exception ignored) {}
+
+            // 2. Build process definition readable names map
+            Map<String, String> procDefNames = new HashMap<>();
+            try {
+                String procUrl = camundaUrl + "/process-definition";
+                ResponseEntity<List<Map<String, Object>>> procResp = restTemplate.exchange(
+                        procUrl, HttpMethod.GET, null, new ParameterizedTypeReference<>() {});
+                if (procResp.getBody() != null) {
+                    for (Map<String, Object> pd : procResp.getBody()) {
+                        String k = (String) pd.get("key");
+                        String n = (String) pd.get("name");
+                        if (k != null && n != null && !n.isBlank()) {
+                            procDefNames.putIfAbsent(k, n);
+                        }
+                    }
+                }
+            } catch (Exception ignored) {}
+
+            List<Map<String, Object>> instances = new ArrayList<>();
+
+            if (isAdmin) {
+                // Admins see all instances (active + completed, or filtered by status)
+                StringBuilder urlBuilder = new StringBuilder(camundaUrl);
+                urlBuilder.append("/history/process-instance?sortBy=startTime&sortOrder=desc");
+                if (activeOnly) {
+                    urlBuilder.append("&active=true");
+                } else if (finishedOnly) {
+                    urlBuilder.append("&finished=true");
+                }
+                if (processDefinitionKey != null && !processDefinitionKey.isBlank()) {
+                    urlBuilder.append("&processDefinitionKey=").append(processDefinitionKey.trim());
+                }
+                ResponseEntity<List<Map<String, Object>>> resp = restTemplate.exchange(
+                        urlBuilder.toString(), HttpMethod.GET, null, new ParameterizedTypeReference<>() {});
+                if (resp.getBody() != null) {
+                    instances.addAll(resp.getBody());
+                }
+            } else {
+                // Regular users see instances they started OR participated in / have tasks in
+                Set<String> instanceIds = new HashSet<>();
+
+                // Instances started by username directly in Camunda
+                try {
+                    String url = camundaUrl + "/history/process-instance?startedBy=" + username;
+                    if (activeOnly) url += "&active=true";
+                    else if (finishedOnly) url += "&finished=true";
+                    if (processDefinitionKey != null && !processDefinitionKey.isBlank()) {
+                        url += "&processDefinitionKey=" + processDefinitionKey.trim();
+                    }
+                    ResponseEntity<List<Map<String, Object>>> resp = restTemplate.exchange(
+                            url, HttpMethod.GET, null, new ParameterizedTypeReference<>() {});
+                    if (resp.getBody() != null) {
+                        for (Map<String, Object> pi : resp.getBody()) {
+                            instanceIds.add((String) pi.get("id"));
+                        }
+                    }
+                } catch (Exception ignored) {}
+
+                // Instances started by username recorded in starterUserId variable
+                for (Map.Entry<String, String> entry : starterVarMap.entrySet()) {
+                    if (username.equalsIgnoreCase(entry.getValue())) {
+                        instanceIds.add(entry.getKey());
+                    }
+                }
+
+                // Instances where the user has at least one task (active or completed)
+                try {
+                    String taskUrl = camundaUrl + "/history/task?taskAssignee=" + username;
+                    ResponseEntity<List<Map<String, Object>>> taskResp = restTemplate.exchange(
+                            taskUrl, HttpMethod.GET, null, new ParameterizedTypeReference<>() {});
+                    if (taskResp.getBody() != null) {
+                        for (Map<String, Object> t : taskResp.getBody()) {
+                            String pi = (String) t.get("processInstanceId");
+                            if (pi != null) instanceIds.add(pi);
+                        }
+                    }
+                } catch (Exception ignored) {}
+
+                if (!instanceIds.isEmpty()) {
+                    Map<String, Object> queryBody = new HashMap<>();
+                    queryBody.put("processInstanceIds", new ArrayList<>(instanceIds));
+                    if (activeOnly) {
+                        queryBody.put("active", true);
+                    } else if (finishedOnly) {
+                        queryBody.put("finished", true);
+                    }
+                    queryBody.put("sorting", List.of(Map.of("sortBy", "startTime", "sortOrder", "desc")));
+                    if (processDefinitionKey != null && !processDefinitionKey.isBlank()) {
+                        queryBody.put("processDefinitionKey", processDefinitionKey.trim());
+                    }
+
+                    try {
+                        ResponseEntity<List<Map<String, Object>>> postResp = restTemplate.exchange(
+                                camundaUrl + "/history/process-instance",
+                                HttpMethod.POST,
+                                new HttpEntity<>(queryBody),
+                                new ParameterizedTypeReference<>() {}
+                        );
+                        if (postResp.getBody() != null) {
+                            instances.addAll(postResp.getBody());
+                        }
+                    } catch (Exception ignored) {}
+                }
+            }
+
+            // Enrich instances with startUserName, fallback starterUserId, duration, and state
+            for (Map<String, Object> inst : instances) {
+                String instId = (String) inst.get("id");
+                String startUser = (String) inst.get("startUserId");
+                if (startUser == null || startUser.isBlank()) {
+                    startUser = starterVarMap.get(instId);
+                }
+                if (startUser == null || startUser.isBlank()) {
+                    startUser = "System";
+                }
+                inst.put("startUserId", startUser);
+                inst.put("startUserName", userNames.getOrDefault(startUser, startUser));
+
+                String defKey = (String) inst.get("processDefinitionKey");
+                String defName = (String) inst.get("processDefinitionName");
+                if (defName == null || defName.isBlank()) {
+                    inst.put("processDefinitionName", procDefNames.getOrDefault(defKey, defKey));
+                }
+
+                // Duration calculation: fix N/A for both completed and running instances
+                Number dur = (Number) inst.get("durationInMillis");
+                if (dur != null) {
+                    inst.put("duration", dur.longValue());
+                } else {
+                    String startStr = (String) inst.get("startTime");
+                    if (startStr != null) {
+                        try {
+                            java.text.SimpleDateFormat sdf = new java.text.SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSSX");
+                            long startMs = sdf.parse(startStr).getTime();
+                            long elapsed = Math.max(0, System.currentTimeMillis() - startMs);
+                            inst.put("duration", elapsed);
+                        } catch (Exception ex) {
+                            try {
+                                java.time.OffsetDateTime odt = java.time.OffsetDateTime.parse(startStr);
+                                long elapsed = Math.max(0, java.time.Duration.between(odt, java.time.OffsetDateTime.now()).toMillis());
+                                inst.put("duration", elapsed);
+                            } catch (Exception ignored) {
+                                inst.put("duration", null);
+                            }
+                        }
+                    } else {
+                        inst.put("duration", null);
+                    }
+                }
+
+                String st = (String) inst.get("state");
+                if (st == null || st.isBlank()) {
+                    st = (inst.get("endTime") == null) ? "ACTIVE" : "COMPLETED";
+                    inst.put("state", st);
+                }
+            }
+
+            // Sort by startTime descending so newest active and completed instances appear first
+            instances.sort((a, b) -> {
+                String startA = (String) a.get("startTime");
+                String startB = (String) b.get("startTime");
+                if (startA == null && startB == null) return 0;
+                if (startA == null) return 1;
+                if (startB == null) return -1;
+                return startB.compareTo(startA);
+            });
+
+            return ResponseEntity.ok(instances);
+        } catch (HttpStatusCodeException e) {
+            return ResponseEntity.status(e.getStatusCode()).body(e.getResponseBodyAsString());
+        } catch (Exception e) {
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(Map.of("error", e.getMessage()));
+        }
+    }
+
+    @GetMapping("/instances/{instanceId}/tasks")
+    public ResponseEntity<?> getInstanceTasks(@PathVariable String instanceId) {
+        try {
+            String url = camundaUrl + "/history/task?processInstanceId=" + instanceId + "&sortBy=startTime&sortOrder=asc";
+            ResponseEntity<List<Map<String, Object>>> response = restTemplate.exchange(
+                    url,
+                    HttpMethod.GET,
+                    null,
+                    new ParameterizedTypeReference<>() {}
+            );
+            List<Map<String, Object>> tasks = response.getBody();
+            if (tasks == null) tasks = Collections.emptyList();
+
+            return ResponseEntity.ok(taskInterceptorService.enrichTasks(tasks));
+        } catch (HttpStatusCodeException e) {
+            return ResponseEntity.status(e.getStatusCode()).body(e.getResponseBodyAsString());
+        } catch (Exception e) {
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(Map.of("error", e.getMessage()));
+        }
+    }
+
+    @GetMapping("/tasks/{taskId}/history-form")
+    public ResponseEntity<?> getTaskHistoryForm(@PathVariable String taskId) {
+        try {
+            // 1. Get task history
+            String taskUrl = camundaUrl + "/history/task?taskId=" + taskId;
+            ResponseEntity<List<Map<String, Object>>> taskResp = restTemplate.exchange(
+                    taskUrl, HttpMethod.GET, null, new ParameterizedTypeReference<>() {});
+            List<Map<String, Object>> taskList = taskResp.getBody();
+            if (taskList == null || taskList.isEmpty()) {
+                return ResponseEntity.status(HttpStatus.NOT_FOUND).body(Map.of("error", "Task not found in history"));
+            }
+            Map<String, Object> task = taskList.get(0);
+            String procDefId = (String) task.get("processDefinitionId");
+            String taskDefKey = (String) task.get("taskDefinitionKey");
+            String procInstId = (String) task.get("processInstanceId");
+
+            // 2. Get submitted variables for this process instance
+            Map<String, Object> submittedData = new HashMap<>();
+            if (procInstId != null) {
+                try {
+                    String varUrl = camundaUrl + "/history/variable-instance?processInstanceId=" + procInstId;
+                    ResponseEntity<List<Map<String, Object>>> varResp = restTemplate.exchange(
+                            varUrl, HttpMethod.GET, null, new ParameterizedTypeReference<>() {});
+                    if (varResp.getBody() != null) {
+                        for (Map<String, Object> v : varResp.getBody()) {
+                            submittedData.put((String) v.get("name"), v.get("value"));
+                        }
+                    }
+                } catch (Exception ignored) {}
+            }
+
+            // 3. Resolve BPMN XML and find formKey/formRef
+            String formResourceName = null;
+            if (procDefId != null && taskDefKey != null) {
+                try {
+                    String xmlUrl = camundaUrl + "/process-definition/" + procDefId + "/xml";
+                    Map<String, Object> xmlResp = restTemplate.getForObject(xmlUrl, Map.class);
+                    if (xmlResp != null && xmlResp.get("bpmn20Xml") != null) {
+                        String xml = (String) xmlResp.get("bpmn20Xml");
+                        java.util.regex.Pattern p = java.util.regex.Pattern.compile("<(?:bpmn:)?userTask[^>]*id=\"" + java.util.regex.Pattern.quote(taskDefKey) + "\"[^>]*>");
+                        java.util.regex.Matcher m = p.matcher(xml);
+                        if (m.find()) {
+                            String tag = m.group(0);
+                            java.util.regex.Matcher fk = java.util.regex.Pattern.compile("camunda:formKey=\"([^\"]+)\"").matcher(tag);
+                            if (fk.find()) {
+                                String rawKey = fk.group(1);
+                                formResourceName = rawKey.contains(":") ? rawKey.substring(rawKey.lastIndexOf(':') + 1) : rawKey;
+                            } else {
+                                java.util.regex.Matcher fr = java.util.regex.Pattern.compile("camunda:formRef=\"([^\"]+)\"").matcher(tag);
+                                if (fr.find()) {
+                                    formResourceName = fr.group(1) + ".form";
+                                }
+                            }
+                        }
+                    }
+                } catch (Exception ignored) {}
+            }
+
+            // 4. Fetch deployed form schema from deployment resources
+            Object formSchema = null;
+            if (formResourceName != null && procDefId != null) {
+                try {
+                    String defUrl = camundaUrl + "/process-definition/" + procDefId;
+                    Map<String, Object> defResp = restTemplate.getForObject(defUrl, Map.class);
+                    if (defResp != null && defResp.get("deploymentId") != null) {
+                        String deploymentId = (String) defResp.get("deploymentId");
+                        String resUrl = camundaUrl + "/deployment/" + deploymentId + "/resources";
+                        ResponseEntity<List<Map<String, Object>>> resResp = restTemplate.exchange(
+                                resUrl, HttpMethod.GET, null, new ParameterizedTypeReference<>() {});
+                        if (resResp.getBody() != null) {
+                            for (Map<String, Object> r : resResp.getBody()) {
+                                String name = (String) r.get("name");
+                                if (name != null && (name.equals(formResourceName) || name.endsWith("/" + formResourceName))) {
+                                    String dataUrl = camundaUrl + "/deployment/" + deploymentId + "/resources/" + r.get("id") + "/data";
+                                    byte[] bytes = restTemplate.getForObject(dataUrl, byte[].class);
+                                    if (bytes != null && bytes.length > 0) {
+                                        try {
+                                            formSchema = new com.fasterxml.jackson.databind.ObjectMapper().readValue(bytes, Object.class);
+                                        } catch (Exception ex) {
+                                            formSchema = new String(bytes, java.nio.charset.StandardCharsets.UTF_8);
+                                        }
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } catch (Exception ignored) {}
+            }
+
+            Map<String, Object> result = new HashMap<>();
+            result.put("task", task);
+            result.put("hasSchema", formSchema != null);
+            result.put("schema", formSchema);
+            result.put("data", submittedData);
+
             return ResponseEntity.ok(result);
         } catch (HttpStatusCodeException e) {
             return ResponseEntity.status(e.getStatusCode()).body(e.getResponseBodyAsString());
