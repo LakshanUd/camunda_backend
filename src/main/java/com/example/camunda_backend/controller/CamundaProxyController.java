@@ -28,12 +28,18 @@ public class CamundaProxyController {
 
     private final UserRepository userRepository;
     private final com.example.camunda_backend.service.TaskInterceptorService taskInterceptorService;
+    private final com.example.camunda_backend.service.FormAuditService formAuditService;
+    private final com.fasterxml.jackson.databind.ObjectMapper objectMapper;
     private final RestTemplate restTemplate = new RestTemplate();
 
     public CamundaProxyController(UserRepository userRepository,
-                                  com.example.camunda_backend.service.TaskInterceptorService taskInterceptorService) {
+                                  com.example.camunda_backend.service.TaskInterceptorService taskInterceptorService,
+                                  com.example.camunda_backend.service.FormAuditService formAuditService,
+                                  com.fasterxml.jackson.databind.ObjectMapper objectMapper) {
         this.userRepository = userRepository;
         this.taskInterceptorService = taskInterceptorService;
+        this.formAuditService = formAuditService;
+        this.objectMapper = objectMapper != null ? objectMapper : new com.fasterxml.jackson.databind.ObjectMapper();
     }
 
     // ========================================================================
@@ -104,6 +110,23 @@ public class CamundaProxyController {
             variables.putIfAbsent("initiator",     Map.of("value", starterUserId, "type", "String"));
 
             Object response = restTemplate.postForObject(url, requestBody, Object.class);
+
+            // Record process instance in MySQL database
+            if (response instanceof Map<?, ?> respMap) {
+                try {
+                    String piId = (String) respMap.get("id");
+                    String defId = (String) respMap.get("definitionId");
+                    String defKey = defId != null && defId.contains(":") ? defId.split(":")[0] : id;
+                    Integer ver = null;
+                    if (defId != null && defId.contains(":")) {
+                        try { ver = Integer.parseInt(defId.split(":")[1]); } catch (Exception ignored) {}
+                    }
+                    String bKey = (String) respMap.get("businessKey");
+                    formAuditService.recordProcessInstanceStart(piId, defKey, null, ver, bKey, starterUserId);
+                } catch (Exception ex) {
+                    logger.debug("Failed to record process start in audit DB: {}", ex.getMessage());
+                }
+            }
 
             // Immediately trigger assignment engine so the first task gets assigned with 0 delay
             try {
@@ -319,9 +342,12 @@ public class CamundaProxyController {
             Object variables = restTemplate.getForObject(url, Object.class);
             return ResponseEntity.ok(variables != null ? variables : Collections.emptyMap());
         } catch (HttpStatusCodeException e) {
+            if (e.getStatusCode() == HttpStatus.NOT_FOUND || e.getStatusCode() == HttpStatus.INTERNAL_SERVER_ERROR) {
+                return getCompletedTaskVariables(taskId);
+            }
             return ResponseEntity.status(e.getStatusCode()).body(e.getResponseBodyAsString());
         } catch (Exception e) {
-            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(Map.of("error", e.getMessage()));
+            return getCompletedTaskVariables(taskId);
         }
     }
 
@@ -339,25 +365,80 @@ public class CamundaProxyController {
     }
 
     @PostMapping({"/tasks/{taskId}/submit", "/tasks/{taskId}/complete"})
-    public ResponseEntity<?> submitTask(@PathVariable String taskId, @RequestBody(required = false) Map<String, Object> payload) {
+    public ResponseEntity<?> submitTask(@PathVariable String taskId,
+                                        @RequestBody(required = false) Map<String, Object> payload,
+                                        Authentication authentication) {
+        String submittedBy = "anonymous";
+        if (authentication != null && authentication.getPrincipal() instanceof CustomUserPrincipal principal) {
+            submittedBy = principal.getUsername();
+        } else if (authentication != null) {
+            submittedBy = authentication.getName();
+        }
+
+        // 1. Fetch task info snapshot BEFORE completing (while task is active in Camunda)
+        Map<String, Object> taskInfo = null;
+        try {
+            taskInfo = restTemplate.getForObject(camundaUrl + "/task/" + taskId, Map.class);
+            if (taskInfo != null) {
+                formAuditService.recordTaskCreatedOrUpdated(taskInfo);
+            }
+        } catch (Exception ignored) {}
+
+        // 2. Fetch deployed form schema snapshot
+        Object schema = null;
+        try {
+            schema = restTemplate.getForObject(camundaUrl + "/task/" + taskId + "/deployed-form", Object.class);
+        } catch (Exception ignored) {}
+
+        String formKey = (taskInfo != null && taskInfo.get("formKey") != null) ? (String) taskInfo.get("formKey") : null;
+        String procInstId = (taskInfo != null && taskInfo.get("processInstanceId") != null) ? (String) taskInfo.get("processInstanceId") : null;
+        Map<String, Object> body = (payload != null) ? payload : Map.of("variables", Map.of());
+
+        // 3. Submit to Camunda engine
+        ResponseEntity<?> camundaResponse;
         try {
             String url = camundaUrl + "/task/" + taskId + "/submit-form";
-            Map<String, Object> body = (payload != null) ? payload : Map.of("variables", Map.of());
             Object response = restTemplate.postForObject(url, body, Object.class);
-            return ResponseEntity.ok(response != null ? response : Map.of("status", "Task completed successfully"));
+            camundaResponse = ResponseEntity.ok(response != null ? response : Map.of("status", "Task completed successfully"));
         } catch (Exception e) {
             // Fallback to /complete if submit-form fails or isn't applicable
             try {
                 String completeUrl = camundaUrl + "/task/" + taskId + "/complete";
-                Map<String, Object> body = (payload != null) ? payload : Map.of("variables", Map.of());
                 restTemplate.postForLocation(completeUrl, body);
-                return ResponseEntity.ok(Map.of("status", "Task completed successfully"));
+                camundaResponse = ResponseEntity.ok(Map.of("status", "Task completed successfully"));
             } catch (HttpStatusCodeException ex) {
                 return ResponseEntity.status(ex.getStatusCode()).body(ex.getResponseBodyAsString());
             } catch (Exception ex) {
                 return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(Map.of("error", ex.getMessage()));
             }
         }
+
+        // 4. Persist form submission, variables, and completed task in MySQL database upon success
+        try {
+            formAuditService.recordFormSubmission(taskId, submittedBy, body, schema, formKey);
+        } catch (Exception ex) {
+            logger.warn("Failed to record form submission in audit DB for task {}: {}", taskId, ex.getMessage());
+        }
+
+        // 5. Check if process instance finished
+        if (procInstId != null) {
+            try {
+                ResponseEntity<List<Map<String, Object>>> piCheck = restTemplate.exchange(
+                        camundaUrl + "/history/process-instance?processInstanceId=" + procInstId,
+                        HttpMethod.GET, null, new ParameterizedTypeReference<>() {});
+                if (piCheck.getBody() != null && !piCheck.getBody().isEmpty()) {
+                    Map<String, Object> histPi = piCheck.getBody().get(0);
+                    String state = (String) histPi.get("state");
+                    if ("COMPLETED".equalsIgnoreCase(state)) {
+                        Object durObj = histPi.get("durationInMillis");
+                        Long dur = durObj instanceof Number ? ((Number) durObj).longValue() : null;
+                        formAuditService.recordProcessInstanceCompletion(procInstId, java.time.LocalDateTime.now(), dur, "COMPLETED");
+                    }
+                }
+            } catch (Exception ignored) {}
+        }
+
+        return camundaResponse;
     }
 
     @GetMapping("/tasks/completed")
@@ -409,10 +490,24 @@ public class CamundaProxyController {
         }
     }
 
-    @GetMapping({"/tasks/completed/{taskId}/variables", "/tasks/{taskId}/variables"})
+    @GetMapping("/tasks/completed/{taskId}/variables")
     public ResponseEntity<?> getCompletedTaskVariables(@PathVariable String taskId) {
         try {
-            // 1. Resolve task to obtain its processInstanceId
+            // Check local MySQL database first (fast & persistent)
+            List<com.example.camunda_backend.entity.CustomFormVariable> localVars = formAuditService.getVariablesForTask(taskId);
+            if (localVars != null && !localVars.isEmpty()) {
+                List<Map<String, Object>> varList = new ArrayList<>();
+                for (com.example.camunda_backend.entity.CustomFormVariable v : localVars) {
+                    Map<String, Object> map = new HashMap<>();
+                    map.put("name", v.getVariableName());
+                    map.put("type", v.getVariableType());
+                    map.put("value", parseDbVarValue(v.getVariableValue(), v.getVariableType()));
+                    varList.add(map);
+                }
+                return ResponseEntity.ok(varList);
+            }
+
+            // 1. Resolve task to obtain its processInstanceId from Camunda
             String taskUrl = camundaUrl + "/history/task?taskId=" + taskId;
             ResponseEntity<List<Map<String, Object>>> taskResp = restTemplate.exchange(
                     taskUrl,
@@ -755,7 +850,34 @@ public class CamundaProxyController {
     @GetMapping("/tasks/{taskId}/history-form")
     public ResponseEntity<?> getTaskHistoryForm(@PathVariable String taskId) {
         try {
-            // 1. Get task history
+            // 1. Check local MySQL database first (instant & reliable)
+            Optional<com.example.camunda_backend.entity.CustomFormSubmission> subOpt = formAuditService.getFormSubmissionForTask(taskId);
+            if (subOpt.isPresent()) {
+                com.example.camunda_backend.entity.CustomFormSubmission sub = subOpt.get();
+                Map<String, Object> result = new HashMap<>();
+                result.put("taskId", sub.getTaskId());
+                result.put("taskDefinitionKey", sub.getTaskDefinitionKey());
+                result.put("submittedBy", sub.getSubmittedBy());
+                result.put("submittedAt", sub.getSubmittedAt());
+                result.put("hasSchema", sub.getFormSchemaJson() != null && !sub.getFormSchemaJson().isBlank());
+                if (sub.getFormSchemaJson() != null) {
+                    try {
+                        result.put("schema", objectMapper.readValue(sub.getFormSchemaJson(), Object.class));
+                    } catch (Exception e) {
+                        result.put("schema", sub.getFormSchemaJson());
+                    }
+                }
+                if (sub.getFormDataJson() != null) {
+                    try {
+                        result.put("data", objectMapper.readValue(sub.getFormDataJson(), Object.class));
+                    } catch (Exception e) {
+                        result.put("data", Collections.emptyMap());
+                    }
+                }
+                return ResponseEntity.ok(result);
+            }
+
+            // 2. Fallback to Camunda REST history for legacy tasks
             String taskUrl = camundaUrl + "/history/task?taskId=" + taskId;
             ResponseEntity<List<Map<String, Object>>> taskResp = restTemplate.exchange(
                     taskUrl, HttpMethod.GET, null, new ParameterizedTypeReference<>() {});
@@ -768,7 +890,7 @@ public class CamundaProxyController {
             String taskDefKey = (String) task.get("taskDefinitionKey");
             String procInstId = (String) task.get("processInstanceId");
 
-            // 2. Get submitted variables for this process instance
+            // 3. Get submitted variables for this process instance
             Map<String, Object> submittedData = new HashMap<>();
             if (procInstId != null) {
                 try {
@@ -783,7 +905,7 @@ public class CamundaProxyController {
                 } catch (Exception ignored) {}
             }
 
-            // 3. Resolve BPMN XML and find formKey/formRef
+            // 4. Resolve BPMN XML and find formKey/formRef
             String formResourceName = null;
             if (procDefId != null && taskDefKey != null) {
                 try {
@@ -810,7 +932,7 @@ public class CamundaProxyController {
                 } catch (Exception ignored) {}
             }
 
-            // 4. Fetch deployed form schema from deployment resources
+            // 5. Fetch deployed form schema from deployment resources
             Object formSchema = null;
             if (formResourceName != null && procDefId != null) {
                 try {
@@ -854,5 +976,22 @@ public class CamundaProxyController {
         } catch (Exception e) {
             return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(Map.of("error", e.getMessage()));
         }
+    }
+
+    private Object parseDbVarValue(String valStr, String type) {
+        if (valStr == null) return null;
+        if ("Boolean".equalsIgnoreCase(type)) {
+            return Boolean.parseBoolean(valStr);
+        }
+        if ("Long".equalsIgnoreCase(type) || "Integer".equalsIgnoreCase(type)) {
+            try { return Long.parseLong(valStr); } catch (Exception ignored) {}
+        }
+        if ("Double".equalsIgnoreCase(type)) {
+            try { return Double.parseDouble(valStr); } catch (Exception ignored) {}
+        }
+        if ("Json".equalsIgnoreCase(type) || (valStr.startsWith("{") && valStr.endsWith("}")) || (valStr.startsWith("[") && valStr.endsWith("]"))) {
+            try { return objectMapper.readValue(valStr, Object.class); } catch (Exception ignored) {}
+        }
+        return valStr;
     }
 }

@@ -57,18 +57,21 @@ public class TaskInterceptorService implements TaskListener {
     private final UserRepository userRepository;
     private final UserGroupMappingRepository userGroupMappingRepo;
     private final AppGroupRepository appGroupRepo;
+    private final FormAuditService formAuditService;
     private final RestTemplate restTemplate = new RestTemplate();
 
     public TaskInterceptorService(TaskRoutingRuleRepository routingRuleRepo,
                                   WorkflowAuthorizationRepository authRepo,
                                   UserRepository userRepository,
                                   UserGroupMappingRepository userGroupMappingRepo,
-                                  AppGroupRepository appGroupRepo) {
+                                  AppGroupRepository appGroupRepo,
+                                  FormAuditService formAuditService) {
         this.routingRuleRepo       = routingRuleRepo;
         this.authRepo              = authRepo;
         this.userRepository        = userRepository;
         this.userGroupMappingRepo  = userGroupMappingRepo;
         this.appGroupRepo          = appGroupRepo;
+        this.formAuditService      = formAuditService;
     }
 
     // =========================================================================
@@ -285,6 +288,9 @@ public class TaskInterceptorService implements TaskListener {
             log.warn("[CLAIM] Camunda /claim call failed for task '{}': {}, falling back to direct assignee", taskId, e.getMessage());
             assignTaskAssignee(taskId, username);
         }
+        try {
+            formAuditService.recordTaskClaimed(taskId, username);
+        } catch (Exception ignored) {}
     }
 
     public void unclaimTask(String taskId, String fallbackGroupId) {
@@ -300,6 +306,9 @@ public class TaskInterceptorService implements TaskListener {
                 restTemplate.postForLocation(camundaApiUrl + "/task/" + taskId + "/assignee", Collections.singletonMap("userId", null));
             } catch (Exception ignored) {}
         }
+        try {
+            formAuditService.recordTaskUnclaimed(taskId, fallbackGroupId);
+        } catch (Exception ignored) {}
 
         // Ensure candidate links exist so task returns to group pool
         if (!hasCandidateLinks(taskId)) {
@@ -482,6 +491,14 @@ public class TaskInterceptorService implements TaskListener {
                 }
             }
         }
+
+        // Persist/update task records in custom_tasks database
+        for (Map<String, Object> task : tasks) {
+            try {
+                formAuditService.recordTaskCreatedOrUpdated(task);
+            } catch (Exception ignored) {}
+        }
+
         return tasks;
     }
 
