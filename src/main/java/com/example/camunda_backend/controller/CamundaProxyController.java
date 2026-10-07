@@ -2,6 +2,7 @@ package com.example.camunda_backend.controller;
 
 import com.example.camunda_backend.entity.User;
 import com.example.camunda_backend.repository.UserRepository;
+import com.example.camunda_backend.repository.WorkflowAuthorizationRepository;
 import com.example.camunda_backend.security.CustomUserPrincipal;
 import jakarta.servlet.http.HttpServletRequest;
 import org.slf4j.Logger;
@@ -27,16 +28,19 @@ public class CamundaProxyController {
     private String camundaUrl;
 
     private final UserRepository userRepository;
+    private final WorkflowAuthorizationRepository workflowAuthRepo;
     private final com.example.camunda_backend.service.TaskInterceptorService taskInterceptorService;
     private final com.example.camunda_backend.service.FormAuditService formAuditService;
     private final com.fasterxml.jackson.databind.ObjectMapper objectMapper;
     private final RestTemplate restTemplate = new RestTemplate();
 
     public CamundaProxyController(UserRepository userRepository,
+                                  WorkflowAuthorizationRepository workflowAuthRepo,
                                   com.example.camunda_backend.service.TaskInterceptorService taskInterceptorService,
                                   com.example.camunda_backend.service.FormAuditService formAuditService,
                                   com.fasterxml.jackson.databind.ObjectMapper objectMapper) {
         this.userRepository = userRepository;
+        this.workflowAuthRepo = workflowAuthRepo;
         this.taskInterceptorService = taskInterceptorService;
         this.formAuditService = formAuditService;
         this.objectMapper = objectMapper != null ? objectMapper : new com.fasterxml.jackson.databind.ObjectMapper();
@@ -46,12 +50,58 @@ public class CamundaProxyController {
     // PROCESS DEFINITION & EXECUTION PROXIES
     // ========================================================================
 
+    private Set<String> getAuthorizedWorkflowKeys(String userId, String username) {
+        Set<String> keys = new HashSet<>();
+        if (userId != null && !userId.isBlank()) {
+            workflowAuthRepo.findByUserId(userId).forEach(a -> keys.add(a.getWorkflowKey()));
+        }
+        if (username != null && !username.isBlank()) {
+            workflowAuthRepo.findByUserId(username).forEach(a -> keys.add(a.getWorkflowKey()));
+            Set<String> userGroups = taskInterceptorService.getUserGroupIds(username);
+            for (String gId : userGroups) {
+                workflowAuthRepo.findByGroupId(gId).forEach(a -> keys.add(a.getWorkflowKey()));
+            }
+        }
+        return keys;
+    }
+
     @GetMapping("/processes")
-    public ResponseEntity<?> getProcesses() {
+    public ResponseEntity<?> getProcesses(Authentication authentication) {
         try {
+            boolean isAdmin = false;
+            String username = null;
+            String userId = null;
+
+            if (authentication != null) {
+                isAdmin = authentication.getAuthorities().stream()
+                        .anyMatch(a -> a.getAuthority().equals("ROLE_ADMIN") || a.getAuthority().equals("ADMIN"));
+                if (authentication.getPrincipal() instanceof CustomUserPrincipal principal) {
+                    username = principal.getUsername();
+                    userId = principal.getId();
+                } else {
+                    username = authentication.getName();
+                }
+            }
+
             String url = camundaUrl + "/process-definition?latestVersion=true&sortBy=name&sortOrder=asc";
-            Object response = restTemplate.getForObject(url, Object.class);
-            return ResponseEntity.ok(response != null ? response : Collections.emptyList());
+            ResponseEntity<List<Map<String, Object>>> response = restTemplate.exchange(
+                    url, HttpMethod.GET, null, new ParameterizedTypeReference<>() {});
+            List<Map<String, Object>> procs = response.getBody() != null ? response.getBody() : Collections.emptyList();
+
+            if (isAdmin) {
+                return ResponseEntity.ok(procs);
+            }
+
+            // Normal users (except admins) should able to see only the access granted workflows for them
+            Set<String> authorizedKeys = getAuthorizedWorkflowKeys(userId, username);
+            List<Map<String, Object>> filtered = procs.stream()
+                    .filter(p -> {
+                        String key = (String) p.get("key");
+                        return key != null && authorizedKeys.contains(key);
+                    })
+                    .collect(Collectors.toList());
+
+            return ResponseEntity.ok(filtered);
         } catch (HttpStatusCodeException e) {
             logger.error("Camunda Engine error on getProcesses [{}]: {}", e.getStatusCode(), e.getResponseBodyAsString());
             return ResponseEntity.status(e.getStatusCode()).body(e.getResponseBodyAsString());
@@ -95,11 +145,28 @@ public class CamundaProxyController {
         try {
             String url = camundaUrl + "/process-definition/" + id + "/start";
 
-            // Inject authenticated user as 'starterUserId' variable for STAR routing strategy.
-            // The TaskInterceptorService reads this variable on task.create events.
+            boolean isAdmin = false;
             String starterUserId = "anonymous";
-            if (authentication != null && authentication.getPrincipal() instanceof CustomUserPrincipal) {
-                starterUserId = ((CustomUserPrincipal) authentication.getPrincipal()).getUsername();
+            String userId = null;
+            if (authentication != null) {
+                isAdmin = authentication.getAuthorities().stream()
+                        .anyMatch(a -> a.getAuthority().equals("ROLE_ADMIN") || a.getAuthority().equals("ADMIN"));
+                if (authentication.getPrincipal() instanceof CustomUserPrincipal principal) {
+                    starterUserId = principal.getUsername();
+                    userId = principal.getId();
+                } else {
+                    starterUserId = authentication.getName();
+                }
+            }
+
+            // Normal users must be authorized to start this process
+            String processKey = id.contains(":") ? id.split(":")[0] : id;
+            if (!isAdmin) {
+                Set<String> authorizedKeys = getAuthorizedWorkflowKeys(userId, starterUserId);
+                if (!authorizedKeys.contains(processKey)) {
+                    return ResponseEntity.status(HttpStatus.FORBIDDEN)
+                            .body(Map.of("error", "Access Denied: You do not have permission to start workflow '" + processKey + "'"));
+                }
             }
 
             Map<String, Object> requestBody = (payload != null) ? new HashMap<>(payload) : new HashMap<>();
@@ -624,8 +691,10 @@ public class CamundaProxyController {
                     .anyMatch(a -> a.getAuthority().equals("ROLE_ADMIN") || a.getAuthority().equals("ADMIN"));
 
             String username = "anonymous";
+            String userId = null;
             if (authentication != null && authentication.getPrincipal() instanceof CustomUserPrincipal principal) {
                 username = principal.getUsername();
+                userId = principal.getId();
             } else if (authentication != null) {
                 username = authentication.getName();
             }
@@ -817,6 +886,17 @@ public class CamundaProxyController {
                 if (startB == null) return -1;
                 return startB.compareTo(startA);
             });
+
+            // Normal users (except admins) should only see instances of workflows granted to them
+            if (!isAdmin) {
+                Set<String> authorizedKeys = getAuthorizedWorkflowKeys(userId, username);
+                instances = instances.stream()
+                        .filter(inst -> {
+                            String defKey = (String) inst.get("processDefinitionKey");
+                            return defKey != null && authorizedKeys.contains(defKey);
+                        })
+                        .collect(Collectors.toList());
+            }
 
             return ResponseEntity.ok(instances);
         } catch (HttpStatusCodeException e) {
